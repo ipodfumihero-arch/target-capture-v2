@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>ターゲットキャプチャ TARGET CAPTURE</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          cream: '#FAF7EE',
+          sage: '#4D7C5D',
+          'sage-dark': '#3c6349',
+          terracotta: '#E07A5F',
+          'terracotta-dark': '#c4614a'
+        }
+      }
+    }
+  };
+</script>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/open-location-code@1.0.3/openlocationcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+
+<style>
+  html, body { background:#FAF7EE; overscroll-behavior:none; -webkit-tap-highlight-color: transparent; }
+  * { touch-action: manipulation; }
+  .leaflet-container { background:#e5e1d3; font-family: inherit; }
+  @keyframes tc-spin { to { transform: rotate(360deg); } }
+  .tc-spin { animation: tc-spin 1s linear infinite; }
+  @keyframes tc-flash-ok { 0%{background-color:#c8ddc9;} 100%{background-color:transparent;} }
+  @keyframes tc-flash-ng { 0%{background-color:#f5cfc3;} 100%{background-color:transparent;} }
+  .tc-flash-ok { animation: tc-flash-ok 900ms ease-out; }
+  .tc-flash-ng { animation: tc-flash-ng 900ms ease-out; }
+  .tc-scrollbar-none::-webkit-scrollbar { display:none; }
+  .tc-scrollbar-none { -ms-overflow-style:none; scrollbar-width:none; }
+  input[type=number]::-webkit-outer-spin-button,
+  input[type=number]::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+  .tc-cooldown-bar { transition: width linear; }
+</style>
+</head>
+<body class="bg-cream text-stone-900 min-h-screen">
+<div id="app" class="min-h-screen pb-8"></div>
+<div id="toast" class="fixed left-1/2 -translate-x-1/2 top-3 z-[9999] w-[92%] max-w-md pointer-events-none"></div>
+
+<script>
+'use strict';
+/* =========================================================================
+   ターゲットキャプチャ (TARGET CAPTURE) - 単一ファイル完結アプリ
+   ========================================================================= */
+
+/* ---------- 定数 ---------- */
+const HINT_LEVELS = [
+  null,
+  { lv:1, label:'超接写',   points:10, floor:7 },
+  { lv:2, label:'接写',     points:7,  floor:5 },
+  { lv:3, label:'全体像',   points:5,  floor:3 },
+  { lv:4, label:'周辺環境', points:3,  floor:1 },
+  { lv:5, label:'広域風景', points:1,  floor:0 }
+];
+const COOLDOWN_MS = 4000;
+const DEFAULT_TIME_LIMIT_MIN = 20;
+const DEFAULT_RADIUS_M = 25;
+const MIN_RADIUS_M = 5;
+const MAX_RADIUS_M = 200;
+const IMG_MAX_WIDTH = 720;
+const IMG_QUALITY = 0.72;
+const LS_KEY_DB_URL = 'tc_fb_db_url';
+const DB_NAME = 'target_capture_db';
+const DB_VERSION = 1;
+
+/* ---------- 小ユーティリティ ---------- */
+function uid(prefix){ return (prefix||'id') + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,8); }
+function clamp(v, lo, hi){ return Math.min(hi, Math.max(lo, v)); }
+function escHtml(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtTime(sec){
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec/60), s = sec%60;
+  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+function distMeters(lat1, lng1, lat2, lng2){
+  if (lat1==null || lng1==null || lat2==null || lng2==null) return Infinity;
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2-lat1);
+  const dLng = toRad(lng2-lng1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+  const c = 2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R*c;
+}
+let toastTimer = null;
+function toast(msg, kind){
+  const el = document.getElementById('toast');
+  const color = kind==='error' ? 'bg-terracotta text-white' : (kind==='ok' ? 'bg-sage text-white' : 'bg-stone-800 text-white');
+  el.innerHTML = `<div class="${color} rounded-xl shadow-lg px-4 py-3 text-sm font-medium text-center">${escHtml(msg)}</div>`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>{ el.innerHTML=''; }, 3200);
+}
+
+/* ---------- IndexedDB Promiseラッパー ---------- */
+function openDB(){
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('gmRoom')) db.createObjectStore('gmRoom', { keyPath:'id' });
+      if (!db.objectStoreNames.contains('playerSession')) db.createObjectStore('playerSession', { keyPath:'id' });
+    };
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+async function idbPut(store, value){
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).put(value);
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
+  });
+}
+async function idbGet(store, id){
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+async function idbDelete(store, id){
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
+  });
+}
+
+/* ---------- Firebase Realtime Database REST (SDK不使用) ---------- */
+function randomRoomCode(){
+  return String(Math.floor(1000 + Math.random()*9000));
+}
+// Firebaseのデータベースは作成リージョンによってドメイン形式が異なる
+// （例: https://xxx.firebaseio.com / https://xxx-default-rtdb.asia-southeast1.firebasedatabase.app）
+// ため、末尾スラッシュだけ取り除いてそのままベースURLとして使う。
+function normalizeDbUrl(url){
+  return String(url||'').trim().replace(/\/+$/, '');
+}
+async function createRoomWithRetry(dbUrl, roomData, maxAttempts){
+  maxAttempts = maxAttempts || 3;
+  const base = normalizeDbUrl(dbUrl);
+  let lastErr = null;
+  for (let i=0; i<maxAttempts; i++){
+    const code = randomRoomCode();
+    const url = `${base}/rooms/${code}.json`;
+    try {
+      const res = await fetch(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(roomData)
+      });
+      if (res.ok) return code;
+      lastErr = new Error('HTTP ' + res.status);
+    } catch(e){
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('部屋の作成に失敗しました');
+}
+async function fetchRoom(dbUrl, roomCode){
+  const base = normalizeDbUrl(dbUrl);
+  const url = `${base}/rooms/${roomCode}.json`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('通信エラー (HTTP ' + res.status + ')');
+  const data = await res.json();
+  if (!data) throw new Error('お題データが見つかりません。暗号をご確認ください。');
+  return data;
+}
+
+/* ---------- 画像自動圧縮 (Canvas API) ---------- */
+function compressImageFile(file){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        if (w > IMG_MAX_WIDTH){
+          h = Math.round(h * IMG_MAX_WIDTH / w);
+          w = IMG_MAX_WIDTH;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', IMG_QUALITY));
+      };
+      img.onerror = () => reject(new Error('画像の読み込みに失敗しました'));
+      img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error('ファイルの読み込みに失敗しました'));
+    reader.readAsDataURL(file);
+  });
+}
+
+/* ---------- OpenLocationCode (Plus Code) 連携 ---------- */
+let olcInstance = null;
+(function initOlc(){
+  try {
+    const ns = window.OpenLocationCode;
+    const Ctor = ns && (ns.OpenLocationCode || (typeof ns === 'function' ? ns : null));
+    if (typeof Ctor === 'function'){
+      const inst = new Ctor();
+      const testCode = inst.encode(35.681236, 139.767125, 10);
+      const testDecoded = inst.decode(testCode);
+      if (testDecoded && typeof testDecoded.latitudeCenter === 'number') olcInstance = inst;
+    }
+  } catch(e){ olcInstance = null; }
+})();
+function olcEncodeSafe(lat, lng){
+  if (!olcInstance || lat==null || lng==null) return '';
+  try { return olcInstance.encode(lat, lng, 10); } catch(e){ return ''; }
+}
+function olcDecodeSafe(code, refLat, refLng){
+  if (!olcInstance || !code) return null;
+  try {
+    let full = code.trim().toUpperCase();
+    if (olcInstance.isFull(full)){
+      const d = olcInstance.decode(full);
+      return { lat: d.latitudeCenter, lng: d.longitudeCenter };
+    }
+    if (olcInstance.isShort(full) && refLat!=null && refLng!=null){
+      full = olcInstance.recoverNearest(full, refLat, refLng);
+      const d = olcInstance.decode(full);
+      return { lat: d.latitudeCenter, lng: d.longitudeCenter };
+    }
+    return null;
+  } catch(e){ return null; }
+}
+
+/* ---------- Leaflet 地図ライフサイクル管理 ---------- */
+window.__activeMaps = window.__activeMaps || {};
+function cleanupTargetMaps(){
+  Object.keys(window.__activeMaps).forEach(k => {
+    try { window.__activeMaps[k].remove(); } catch(e){}
+  });
+  window.__activeMaps = {};
+}
+function initTargetMap(targetId){
+  const el = document.getElementById('map_' + targetId);
+  if (!el || typeof L === 'undefined') return;
+  const t = findDraftTarget(targetId);
+  if (!t) return;
+  const hasPos = t.lat != null && t.lng != null;
+  const lat = hasPos ? t.lat : 35.3084;
+  const lng = hasPos ? t.lng : 139.8628; // 富津市付近を初期表示
+  const map = L.map(el, { attributionControl:true, zoomControl:true }).setView([lat, lng], hasPos ? 17 : 13);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    maxZoom: 20, subdomains: 'abcd',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>'
+  }).addTo(map);
+  const marker = L.marker([lat, lng], { draggable:true }).addTo(map);
+  marker.on('dragend', () => {
+    const p = marker.getLatLng();
+    setDraftTargetLatLng(targetId, p.lat, p.lng, true);
+  });
+  map.on('click', (e) => {
+    marker.setLatLng(e.latlng);
+    setDraftTargetLatLng(targetId, e.latlng.lat, e.latlng.lng, true);
+  });
+  window.__activeMaps[targetId] = map;
+  window.__activeMaps[targetId + '_marker'] = marker;
+  setTimeout(() => { try { map.invalidateSize(); } catch(e){} }, 100);
+}
+function initAllTargetMaps(){
+  cleanupTargetMaps();
+  const targets = AppState.gmDraft.targets;
+  targets.forEach(t => initTargetMap(t.id));
+}
+
+/* ---------- アプリ状態 ---------- */
+const AppState = {
+  screen: 'title',
+  loading: false,
+  resumeAvailable: false,
+  resumeSession: null,
+  urlRoomCode: '',
+  urlDbUrl: '',
+  gmDraft: {
+    dbUrl: localStorage.getItem(LS_KEY_DB_URL) || '',
+    timeLimitMin: DEFAULT_TIME_LIMIT_MIN,
+    defaultRadius: DEFAULT_RADIUS_M,
+    targets: []
+  },
+  gmCreatedCode: '',
+  playerJoin: {
+    dbUrl: '',
+    code: ''
+  },
+  session: null,          // { roomCode, timeLimitSec, defaultRadius, targets:[...], remainingSec, totalScore, targetStates:{}, selectedTargetId, startedAt }
+  cooldownUntil: 0,
+  currentPosition: null,
+  gpsWatchId: null,
+  gpsStatus: { active:false, text:'GPS待機中', accuracy:null },
+  timerHandle: null,
+  saveHandle: null,
+  lastResult: null,
+  judgeFeedback: null
+};
+
+function findDraftTarget(id){
+  return AppState.gmDraft.targets.find(t => t.id === id);
+}
+
+/* ---------- ルーティング / レンダリング ---------- */
+function setScreen(screen){
+  AppState.screen = screen;
+  render();
+}
+function render(){
+  const app = document.getElementById('app');
+  let html = '';
+  switch(AppState.screen){
+    case 'title': html = renderTitle(); break;
+    case 'gmSetup': html = renderGmSetup(); break;
+    case 'gmCreated': html = renderGmCreated(); break;
+    case 'playerJoin': html = renderPlayerJoin(); break;
+    case 'playerReady': html = renderPlayerReady(); break;
+    case 'explore': html = renderExplore(); break;
+    case 'result': html = renderResult(); break;
+    default: html = renderTitle();
+  }
+  app.innerHTML = html;
+  afterRender();
+}
+function afterRender(){
+  if (AppState.screen === 'gmSetup'){
+    initAllTargetMaps();
+  } else {
+    cleanupTargetMaps();
+  }
+  if (AppState.screen === 'gmCreated'){
+    drawRoomQr();
+  }
+}
+
+/* =========================================================================
+   タイトル画面
+   ========================================================================= */
+function renderTitle(){
+  const resumeBanner = AppState.resumeAvailable ? `
+    <div class="bg-white border border-stone-300 rounded-2xl p-4 mb-5 shadow-sm">
+      <p class="font-bold mb-1">前回の探索を再開しますか？</p>
+      <p class="text-sm text-stone-600 mb-3">進行中のゲームデータが端末に保存されています。</p>
+      <div class="flex gap-2">
+        <button onclick="resumeSession()" class="flex-1 bg-sage active:bg-sage-dark text-white font-bold rounded-xl py-3">再開する</button>
+        <button onclick="discardResume()" class="flex-1 bg-white border border-terracotta text-terracotta font-bold rounded-xl py-3">破棄して新規</button>
+      </div>
+    </div>` : '';
+
+  return `
+  <div class="max-w-md mx-auto px-5 pt-10">
+    <div class="flex justify-center mb-2">
+      <span id="gps_status_pill" class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-200 text-stone-600 border border-stone-300">${escHtml(AppState.gpsStatus.text)}</span>
+    </div>
+    <div class="text-center mb-8">
+      <div class="text-5xl mb-2">🎯</div>
+      <h1 class="text-2xl font-black tracking-tight">ターゲットキャプチャ</h1>
+      <p class="text-stone-500 text-sm mt-1">TARGET CAPTURE</p>
+    </div>
+    ${resumeBanner}
+    <div class="space-y-3">
+      <button onclick="goGmSetup()" class="w-full bg-white border border-stone-300 rounded-2xl p-5 text-left shadow-sm active:bg-stone-50">
+        <div class="text-xl font-bold">🎮 探索ゲームを作成する</div>
+        <div class="text-sm text-stone-500 mt-1">GM（運営）としてお題を設定し、部屋を作成します</div>
+      </button>
+      <button onclick="goPlayerJoin()" class="w-full bg-sage text-white rounded-2xl p-5 text-left shadow-sm active:bg-sage-dark">
+        <div class="text-xl font-bold">🔑 秘密の暗号でお題を受信</div>
+        <div class="text-sm text-white/85 mt-1">4桁の暗号を入力してゲームに参加します</div>
+      </button>
+    </div>
+  </div>`;
+}
+function goGmSetup(){
+  setScreen('gmSetup');
+}
+function goPlayerJoin(){
+  AppState.playerJoin.dbUrl = AppState.urlDbUrl || localStorage.getItem(LS_KEY_DB_URL) || '';
+  AppState.playerJoin.code = AppState.urlRoomCode || '';
+  setScreen('playerJoin');
+}
+async function checkResumeOnLoad(){
+  try {
+    const s = await idbGet('playerSession', 'current');
+    if (s && s.remainingSec > 0 && s.roomCode){
+      AppState.resumeAvailable = true;
+      AppState.resumeSession = s;
+    }
+  } catch(e){}
+}
+function resumeSession(){
+  AppState.session = AppState.resumeSession;
+  AppState.resumeAvailable = false;
+  startExploreRuntime();
+}
+async function discardResume(){
+  AppState.resumeAvailable = false;
+  AppState.resumeSession = null;
+  try { await idbDelete('playerSession', 'current'); } catch(e){}
+  render();
+}
+
+/* =========================================================================
+   GM画面: 部屋設定 & お題管理
+   ========================================================================= */
+function renderGmSetup(){
+  const d = AppState.gmDraft;
+  const targetsHtml = d.targets.map((t, idx) => renderTargetCard(t, idx, d.targets.length)).join('') ||
+    `<div class="text-center text-stone-400 py-8 border border-dashed border-stone-300 rounded-xl">お題がまだありません。下のボタンから追加してください。</div>`;
+
+  return `
+  <div class="max-w-md mx-auto px-4 pt-6">
+    <div class="flex items-center gap-2 mb-5">
+      <button onclick="goTitle()" class="text-stone-500 text-sm">← 戻る</button>
+      <h1 class="text-lg font-black flex-1 text-center">GM設定・お題管理</h1>
+      <span id="gps_status_pill" class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-200 text-stone-600 border border-stone-300 whitespace-nowrap">${escHtml(AppState.gpsStatus.text)}</span>
+    </div>
+
+    <div class="bg-white border border-stone-300 rounded-2xl p-4 mb-4 shadow-sm space-y-3">
+      <div>
+        <label class="text-xs font-bold text-stone-500">Firebase Realtime Database URL</label>
+        <input id="gm_db_url" type="text" value="${escHtml(d.dbUrl)}" placeholder="https://xxxx-default-rtdb.asia-southeast1.firebasedatabase.app"
+          oninput="updateGmField('dbUrl', this.value)"
+          class="w-full mt-1 border border-stone-300 rounded-lg px-3 py-2 text-sm">
+        <p class="text-[11px] text-stone-400 mt-1">ご自身のFirebase Realtime DatabaseのURLをそのまま入力してください（端末に保存されます）。Firebase Consoleの「Realtime Database」画面上部に表示されているURLをコピーしてください。</p>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-xs font-bold text-stone-500">制限時間（分）</label>
+          <input type="number" min="1" value="${d.timeLimitMin}" oninput="updateGmField('timeLimitMin', this.value)"
+            class="w-full mt-1 border border-stone-300 rounded-lg px-3 py-2 text-sm">
+        </div>
+        <div>
+          <label class="text-xs font-bold text-stone-500">正解許容距離（m）</label>
+          <input type="number" min="${MIN_RADIUS_M}" max="${MAX_RADIUS_M}" value="${d.defaultRadius}" oninput="updateGmField('defaultRadius', this.value)"
+            class="w-full mt-1 border border-stone-300 rounded-lg px-3 py-2 text-sm">
+        </div>
+      </div>
+    </div>
+
+    <h2 class="font-bold text-sm text-stone-600 mb-2">お題一覧（${d.targets.length}件）</h2>
+    <div class="space-y-4">${targetsHtml}</div>
+
+    <button onclick="addTarget()" class="w-full mt-4 border-2 border-dashed border-stone-300 text-stone-500 rounded-xl py-3 font-bold active:bg-stone-50">＋ お題を追加</button>
+
+    <div class="mt-6 pt-4 border-t border-stone-300">
+      <h2 class="font-bold text-sm text-stone-600 mb-2">バックアップ・オフライン配布（JSON）</h2>
+      <p class="text-[11px] text-stone-400 mb-2">お題データ（写真含む）をファイルとして書き出せます。会場の通信が不安定な場合、このファイルをAirDropやLINEで参加者に直接渡し、タイトル画面の「JSONファイルを読み込む」から受信してもらうこともできます。</p>
+      <div class="grid grid-cols-2 gap-2">
+        <button onclick="exportGmDataJSON()" class="py-2.5 bg-white border border-stone-300 rounded-lg text-xs font-bold text-stone-700">📥 JSONを書き出す</button>
+        <label class="py-2.5 bg-white border border-stone-300 rounded-lg text-xs font-bold text-stone-700 text-center cursor-pointer">
+          📤 JSONを読み込む
+          <input type="file" accept="application/json" class="hidden" onchange="importGmDataJSONFile(event)">
+        </label>
+      </div>
+    </div>
+
+    <button onclick="createRoom()" class="w-full mt-6 mb-4 bg-sage text-white font-black rounded-2xl py-4 text-lg shadow-sm active:bg-sage-dark disabled:opacity-50" ${AppState.loading?'disabled':''}>
+      ${AppState.loading ? '作成中…' : '部屋を作成する'}
+    </button>
+  </div>`;
+}
+
+function renderTargetCard(t, idx, total){
+  const hintsHtml = HINT_LEVELS.slice(1).map(h => {
+    const photo = t.hints[h.lv];
+    return `
+    <div class="flex-shrink-0 w-24">
+      <div class="text-[10px] font-bold text-stone-500 mb-1">Lv${h.lv} ${h.label}（${h.points}pt）</div>
+      <label class="block aspect-[9/16] bg-stone-100 border border-stone-300 rounded-lg overflow-hidden relative cursor-pointer">
+        ${photo ? `<img src="${photo}" class="w-full h-full object-cover">` : `<div class="w-full h-full flex items-center justify-center text-stone-400 text-xl">＋</div>`}
+        <input type="file" accept="image/*" capture="environment" class="hidden" onchange="onHintPhotoChange(event,'${t.id}',${h.lv})">
+      </label>
+      ${photo ? `<button onclick="clearHintPhoto('${t.id}',${h.lv})" class="text-[10px] text-terracotta mt-1">削除</button>` : ''}
+    </div>`;
+  }).join('');
+
+  const posLabel = (t.lat!=null && t.lng!=null) ? `${t.lat.toFixed(6)}, ${t.lng.toFixed(6)}` : '未設定';
+
+  return `
+  <div class="bg-white border border-stone-300 rounded-2xl p-4 shadow-sm" data-target-card="${t.id}">
+    <div class="flex items-center gap-2 mb-3">
+      <span class="text-xs font-bold text-stone-400">#${idx+1}</span>
+      <input type="text" value="${escHtml(t.name)}" placeholder="お題名（例: 明鐘岬のトロッコ跡）"
+        oninput="updateTargetField('${t.id}','name',this.value)"
+        class="flex-1 border-b border-stone-300 px-1 py-1 text-sm font-bold focus:outline-none focus:border-sage">
+      <button onclick="moveTargetUp('${t.id}')" ${idx===0?'disabled':''} class="text-stone-400 disabled:opacity-30 text-sm px-1">↑</button>
+      <button onclick="moveTargetDown('${t.id}')" ${idx===total-1?'disabled':''} class="text-stone-400 disabled:opacity-30 text-sm px-1">↓</button>
+      <button onclick="removeTarget('${t.id}')" class="text-terracotta text-sm">削除</button>
+    </div>
+
+    <div class="flex gap-3 overflow-x-auto tc-scrollbar-none pb-2 mb-3">${hintsHtml}</div>
+
+    <div id="map_${t.id}" class="w-full rounded-xl border border-stone-300 mb-3" style="height:192px;"></div>
+
+    <div class="grid grid-cols-2 gap-2 mb-2">
+      <div>
+        <label class="text-[11px] font-bold text-stone-500">緯度</label>
+        <input type="number" step="0.000001" value="${t.lat!=null?t.lat:''}" oninput="onLatLngInput('${t.id}','lat',this.value)"
+          class="w-full border border-stone-300 rounded-lg px-2 py-1.5 text-sm">
+      </div>
+      <div>
+        <label class="text-[11px] font-bold text-stone-500">経度</label>
+        <input type="number" step="0.000001" value="${t.lng!=null?t.lng:''}" oninput="onLatLngInput('${t.id}','lng',this.value)"
+          class="w-full border border-stone-300 rounded-lg px-2 py-1.5 text-sm">
+      </div>
+    </div>
+
+    <div class="mb-2">
+      <label class="text-[11px] font-bold text-stone-500">Plus Code${olcInstance?'':'（この端末では利用できません）'}</label>
+      <div class="flex gap-2">
+        <input id="pluscode_${t.id}" type="text" value="${escHtml(t.plusCode||'')}" ${olcInstance?'':'disabled'} placeholder="例: 8Q7XMPCJ+2V"
+          oninput="updateTargetField('${t.id}','plusCode',this.value)"
+          class="flex-1 border border-stone-300 rounded-lg px-2 py-1.5 text-sm disabled:bg-stone-100">
+        <button onclick="applyPlusCode('${t.id}')" ${olcInstance?'':'disabled'} class="bg-stone-800 text-white text-xs font-bold rounded-lg px-3 disabled:opacity-40">反映</button>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-2 mb-2">
+      <button onclick="setTargetToCurrentLocation('${t.id}')" class="bg-stone-800 text-white text-xs font-bold rounded-lg px-3 py-2">📍 現在地をセット</button>
+      <span id="poslabel_${t.id}" class="text-[11px] text-stone-500 flex-1">${posLabel}</span>
+    </div>
+
+    <div>
+      <label class="text-[11px] font-bold text-stone-500">この場所の正解許容距離（m・任意）</label>
+      <input type="number" min="${MIN_RADIUS_M}" max="${MAX_RADIUS_M}" value="${t.radius!=null?t.radius:''}" placeholder="未入力=全体設定を使用"
+        oninput="updateTargetField('${t.id}','radius',this.value)"
+        class="w-full border border-stone-300 rounded-lg px-2 py-1.5 text-sm">
+    </div>
+  </div>`;
+}
+
+function goTitle(){
+  setScreen('title');
+}
+function updateGmField(key, val){
+  if (key==='timeLimitMin' || key==='defaultRadius'){
+    AppState.gmDraft[key] = val === '' ? '' : Number(val);
+  } else {
+    AppState.gmDraft[key] = val;
+  }
+  if (key === 'dbUrl'){
+    localStorage.setItem(LS_KEY_DB_URL, val || '');
+  }
+  // 数値入力欄はDOM直接更新のみ（再レンダー・地図再初期化を避ける）
+}
+function addTarget(){
+  AppState.gmDraft.targets.push({
+    id: uid('t'), name:'', hints:{}, lat:null, lng:null, plusCode:'', radius:null
+  });
+  render();
+}
+function removeTarget(id){
+  if (!confirm('このお題を削除しますか？')) return;
+  AppState.gmDraft.targets = AppState.gmDraft.targets.filter(t => t.id !== id);
+  render();
+}
+function moveTargetUp(id){
+  const arr = AppState.gmDraft.targets;
+  const i = arr.findIndex(t => t.id === id);
+  if (i <= 0) return;
+  [arr[i-1], arr[i]] = [arr[i], arr[i-1]];
+  render();
+}
+function moveTargetDown(id){
+  const arr = AppState.gmDraft.targets;
+  const i = arr.findIndex(t => t.id === id);
+  if (i === -1 || i >= arr.length-1) return;
+  [arr[i], arr[i+1]] = [arr[i+1], arr[i]];
+  render();
+}
+function updateTargetField(id, field, val){
+  const t = findDraftTarget(id);
+  if (!t) return;
+  if (field === 'radius'){
+    t[field] = val === '' ? null : clamp(Number(val), MIN_RADIUS_M, MAX_RADIUS_M);
+  } else {
+    t[field] = val;
+  }
+}
+async function onHintPhotoChange(evt, targetId, lv){
+  const file = evt.target.files && evt.target.files[0];
+  if (!file) return;
+  try {
+    const dataUrl = await compressImageFile(file);
+    const t = findDraftTarget(targetId);
+    if (!t) return;
+    t.hints[lv] = dataUrl;
+    render();
+  } catch(e){
+    toast('画像の処理に失敗しました', 'error');
+  }
+}
+function clearHintPhoto(targetId, lv){
+  const t = findDraftTarget(targetId);
+  if (!t) return;
+  delete t.hints[lv];
+  render();
+}
+function setDraftTargetLatLng(targetId, lat, lng, fromMap){
+  const t = findDraftTarget(targetId);
+  if (!t) return;
+  t.lat = lat; t.lng = lng;
+  t.plusCode = olcEncodeSafe(lat, lng) || t.plusCode;
+  // 地図操作由来の場合はフル再レンダーせず該当フィールドのみ直接更新（地図の再初期化ループを防止）
+  const latInput = document.querySelector(`[data-target-card="${targetId}"] input[oninput^="onLatLngInput('${targetId}','lat'"]`);
+  const lngInput = document.querySelector(`[data-target-card="${targetId}"] input[oninput^="onLatLngInput('${targetId}','lng'"]`);
+  const posSpan = document.getElementById('poslabel_' + targetId);
+  const pcInput = document.getElementById('pluscode_' + targetId);
+  if (latInput) latInput.value = lat.toFixed(6);
+  if (lngInput) lngInput.value = lng.toFixed(6);
+  if (posSpan) posSpan.textContent = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+  if (pcInput) pcInput.value = t.plusCode;
+}
+function onLatLngInput(targetId, field, val){
+  const t = findDraftTarget(targetId);
+  if (!t) return;
+  const num = val === '' ? null : Number(val);
+  t[field] = num;
+  if (t.lat!=null && t.lng!=null){
+    t.plusCode = olcEncodeSafe(t.lat, t.lng) || t.plusCode;
+    const pcInput = document.getElementById('pluscode_' + targetId);
+    if (pcInput) pcInput.value = t.plusCode;
+    const map = window.__activeMaps[targetId];
+    const marker = window.__activeMaps[targetId + '_marker'];
+    if (map && marker){
+      marker.setLatLng([t.lat, t.lng]);
+      map.panTo([t.lat, t.lng]);
+    }
+  }
+}
+function applyPlusCode(targetId){
+  const t = findDraftTarget(targetId);
+  if (!t) return;
+  const input = document.getElementById('pluscode_' + targetId);
+  const code = input ? input.value : t.plusCode;
+  const refLat = t.lat != null ? t.lat : 35.3084;
+  const refLng = t.lng != null ? t.lng : 139.8628;
+  const result = olcDecodeSafe(code, refLat, refLng);
+  if (!result){
+    toast('Plus Codeを読み取れませんでした。完全なコードを入力するか、地図で指定してください。', 'error');
+    return;
+  }
+  setDraftTargetLatLng(targetId, result.lat, result.lng, false);
+  const map = window.__activeMaps[targetId];
+  if (map) map.setView([result.lat, result.lng], 17);
+  toast('位置を更新しました', 'ok');
+}
+function setTargetToCurrentLocation(targetId){
+  if (!navigator.geolocation){
+    toast('この端末は位置情報に対応していません', 'error');
+    return;
+  }
+  toast('現在地を取得中…');
+  navigator.geolocation.getCurrentPosition((pos) => {
+    setDraftTargetLatLng(targetId, pos.coords.latitude, pos.coords.longitude, false);
+    const map = window.__activeMaps[targetId];
+    if (map) map.setView([pos.coords.latitude, pos.coords.longitude], 17);
+    toast('現在地をセットしました', 'ok');
+  }, (err) => {
+    toast('現在地の取得に失敗しました: ' + err.message, 'error');
+  }, { enableHighAccuracy:true, timeout:10000 });
+}
+
+async function createRoom(){
+  const d = AppState.gmDraft;
+  if (!d.dbUrl || !/^https?:\/\//.test(d.dbUrl)){ toast('Firebase Realtime Database URL を入力してください（https:// から始まるURL）', 'error'); return; }
+  if (d.targets.length === 0){ toast('お題を1件以上追加してください', 'error'); return; }
+  for (const t of d.targets){
+    if (!t.name){ toast('すべてのお題に名前を入力してください', 'error'); return; }
+    if (t.lat==null || t.lng==null){ toast(`「${t.name || '無題'}」の位置が未設定です`, 'error'); return; }
+    if (!t.hints[1]){ toast(`「${t.name}」のLv1ヒント写真は必須です`, 'error'); return; }
+  }
+  AppState.loading = true; render();
+  try {
+    const roomData = {
+      timeLimitSec: Math.max(60, Math.round((Number(d.timeLimitMin)||DEFAULT_TIME_LIMIT_MIN) * 60)),
+      defaultRadius: clamp(Number(d.defaultRadius)||DEFAULT_RADIUS_M, MIN_RADIUS_M, MAX_RADIUS_M),
+      createdAt: Date.now(),
+      targets: d.targets.map(t => ({
+        id: t.id, name: t.name,
+        hints: t.hints,
+        lat: t.lat, lng: t.lng,
+        radius: t.radius
+      }))
+    };
+    const code = await createRoomWithRetry(d.dbUrl, roomData, 3);
+    AppState.gmCreatedCode = code;
+    await idbPut('gmRoom', Object.assign({ id:'current', roomCode: code, dbUrl: d.dbUrl }, roomData));
+    AppState.loading = false;
+    setScreen('gmCreated');
+  } catch(e){
+    AppState.loading = false;
+    render();
+    toast('部屋の作成に失敗しました: ' + e.message, 'error');
+  }
+}
+
+/* GM: お題データのJSONバックアップ書き出し・読み込み */
+function exportGmDataJSON(){
+  const d = AppState.gmDraft;
+  const data = {
+    timeLimitMin: d.timeLimitMin,
+    defaultRadius: d.defaultRadius,
+    targets: d.targets
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const ts = new Date();
+  const stamp = ts.getFullYear() + String(ts.getMonth()+1).padStart(2,'0') + String(ts.getDate()).padStart(2,'0') + '_' + String(ts.getHours()).padStart(2,'0') + String(ts.getMinutes()).padStart(2,'0');
+  a.href = url;
+  a.download = `target_capture_${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  toast('JSONファイルを書き出しました', 'ok');
+}
+function importGmDataJSONFile(evt){
+  const file = evt.target.files && evt.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!Array.isArray(data.targets)) throw new Error('お題データの形式が正しくありません');
+      AppState.gmDraft.timeLimitMin = data.timeLimitMin || AppState.gmDraft.timeLimitMin;
+      AppState.gmDraft.defaultRadius = data.defaultRadius || AppState.gmDraft.defaultRadius;
+      AppState.gmDraft.targets = data.targets.map(t => ({
+        id: t.id || uid('t'),
+        name: t.name || '',
+        hints: t.hints || {},
+        lat: t.lat != null ? t.lat : null,
+        lng: t.lng != null ? t.lng : null,
+        plusCode: t.plusCode || '',
+        radius: t.radius != null ? t.radius : null
+      }));
+      render();
+      toast('JSONファイルを読み込みました', 'ok');
+    } catch(err){
+      toast('JSONの読み込みに失敗しました: ' + err.message, 'error');
+    }
+  };
+  reader.readAsText(file);
+}
+
+/* =========================================================================
+   GM画面: 部屋作成完了
+   ========================================================================= */
+function renderGmCreated(){
+  const code = AppState.gmCreatedCode;
+  const url = buildInviteUrl(code, AppState.gmDraft.dbUrl);
+  return `
+  <div class="max-w-md mx-auto px-5 pt-10 text-center">
+    <div class="text-4xl mb-2">✅</div>
+    <h1 class="text-lg font-bold mb-6">部屋を作成しました</h1>
+
+    <div class="bg-white border border-stone-300 rounded-2xl p-6 shadow-sm mb-5">
+      <p class="text-xs text-stone-500 mb-1">秘密の暗号</p>
+      <p class="text-5xl font-black tracking-widest text-sage">${escHtml(code)}</p>
+    </div>
+
+    <div class="bg-white border border-stone-300 rounded-2xl p-5 shadow-sm mb-5">
+      <canvas id="room_qr_canvas" class="mx-auto"></canvas>
+      <p class="text-[11px] text-stone-400 mt-2">QRコードを読み取るとURLに自動で暗号が入力されます</p>
+    </div>
+
+    <button onclick="copyInviteUrl()" class="w-full bg-stone-800 text-white font-bold rounded-xl py-3 mb-3">招待URLをコピー</button>
+    <p class="text-[11px] text-stone-400 break-all mb-8">${escHtml(url)}</p>
+
+    <button onclick="goTitle()" class="w-full bg-white border border-stone-300 rounded-xl py-3 font-bold">タイトルへ戻る</button>
+  </div>`;
+}
+function buildInviteUrl(code, dbUrl){
+  const base = location.origin + location.pathname;
+  const params = new URLSearchParams();
+  params.set('room', code);
+  if (dbUrl) params.set('db', dbUrl);
+  return base + '?' + params.toString();
+}
+function drawRoomQr(){
+  const canvas = document.getElementById('room_qr_canvas');
+  if (!canvas || typeof QRCode === 'undefined') return;
+  const url = buildInviteUrl(AppState.gmCreatedCode, AppState.gmDraft.dbUrl);
+  try {
+    QRCode.toCanvas(canvas, url, { width: 200, margin: 1, color: { dark:'#1c1917', light:'#FFFFFF' } }, (err) => {
+      if (err) console.error(err);
+    });
+  } catch(e){}
+}
+function copyInviteUrl(){
+  const url = buildInviteUrl(AppState.gmCreatedCode, AppState.gmDraft.dbUrl);
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(url).then(() => toast('URLをコピーしました', 'ok')).catch(() => toast('コピーに失敗しました', 'error'));
+  } else {
+    toast('このブラウザではコピー機能が利用できません', 'error');
+  }
+}
+
+/* =========================================================================
+   プレイヤー画面: 暗号入力 & 受信
+   ========================================================================= */
+function renderPlayerJoin(){
+  const pj = AppState.playerJoin;
+  return `
+  <div class="max-w-md mx-auto px-5 pt-10">
+    <div class="flex items-center gap-2 mb-8">
+      <button onclick="goTitle()" class="text-stone-500 text-sm">← 戻る</button>
+      <h1 class="text-lg font-black flex-1 text-center">暗号でお題を受信</h1>
+      <span id="gps_status_pill" class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-200 text-stone-600 border border-stone-300 whitespace-nowrap">${escHtml(AppState.gpsStatus.text)}</span>
+    </div>
+
+    <div class="bg-white border border-stone-300 rounded-2xl p-6 shadow-sm mb-4">
+      <label class="text-xs font-bold text-stone-500">4桁の秘密の暗号</label>
+      <input id="join_code_input" type="tel" inputmode="numeric" maxlength="4" value="${escHtml(pj.code)}"
+        oninput="updatePlayerJoinField('code', this.value)"
+        placeholder="0000"
+        class="w-full mt-2 mb-4 border border-stone-300 rounded-xl px-4 py-3 text-3xl tracking-[0.5em] text-center font-black">
+
+      <label class="text-xs font-bold text-stone-500">Firebase Realtime Database URL</label>
+      <input type="text" value="${escHtml(pj.dbUrl)}" oninput="updatePlayerJoinField('dbUrl', this.value)"
+        placeholder="GMから共有されたURL"
+        class="w-full mt-2 mb-1 border border-stone-300 rounded-lg px-3 py-2 text-sm">
+      <p class="text-[11px] text-stone-400 mb-4">招待URLから開いた場合は自動入力されています。</p>
+
+      <button onclick="joinRoom()" class="w-full bg-sage text-white font-black rounded-xl py-3 text-lg disabled:opacity-50" ${AppState.loading?'disabled':''}>
+        ${AppState.loading ? '受信中…' : '受信する'}
+      </button>
+    </div>
+
+    <label class="block w-full text-center bg-white border border-stone-300 rounded-xl py-3 text-sm font-bold text-stone-600 cursor-pointer">
+      📄 JSONファイルを読み込む
+      <input type="file" accept="application/json" class="hidden" onchange="importPlayerJSONFile(event)">
+    </label>
+    <p class="text-[11px] text-stone-400 text-center mt-2">GMから直接ファイルを受け取った場合はこちら（通信不要）</p>
+  </div>`;
+}
+function updatePlayerJoinField(key, val){
+  AppState.playerJoin[key] = key==='code' ? val.replace(/[^0-9]/g,'').slice(0,4) : val;
+  if (key === 'dbUrl') localStorage.setItem(LS_KEY_DB_URL, val || '');
+}
+
+/* 受信したお題データからプレイヤー用セッションを組み立てる（Firebase経由・JSON経由で共用） */
+function buildSessionFromRoomData(room, roomCodeLabel, dbUrl){
+  const targetStates = {};
+  (room.targets||[]).forEach(t => {
+    targetStates[t.id] = { status:'untouched', currentLv:1, viewLv:1, currentPoints: HINT_LEVELS[1].points, wrongCount:0 };
+  });
+  const timeLimitSec = room.timeLimitSec || Math.round((room.timeLimitMin || DEFAULT_TIME_LIMIT_MIN) * 60);
+  return {
+    id: 'current',
+    roomCode: roomCodeLabel,
+    dbUrl: dbUrl || '',
+    timeLimitSec,
+    defaultRadius: room.defaultRadius || DEFAULT_RADIUS_M,
+    targets: room.targets || [],
+    remainingSec: timeLimitSec,
+    totalScore: 0,
+    targetStates,
+    selectedTargetId: null,
+    startedAt: Date.now(),
+    updatedAt: Date.now()
+  };
+}
+async function joinRoom(){
+  const pj = AppState.playerJoin;
+  if (pj.code.length !== 4){ toast('4桁の暗号を入力してください', 'error'); return; }
+  if (!pj.dbUrl || !/^https?:\/\//.test(pj.dbUrl)){ toast('Firebase Realtime Database URL を入力してください', 'error'); return; }
+  AppState.loading = true; render();
+  try {
+    const room = await fetchRoom(pj.dbUrl, pj.code);
+    const session = buildSessionFromRoomData(room, pj.code, pj.dbUrl);
+    await idbPut('playerSession', session);
+    AppState.session = session;
+    AppState.loading = false;
+    setScreen('playerReady');
+  } catch(e){
+    AppState.loading = false;
+    render();
+    toast('受信に失敗しました: ' + e.message, 'error');
+  }
+}
+function importPlayerJSONFile(evt){
+  const file = evt.target.files && evt.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!Array.isArray(data.targets)) throw new Error('お題データの形式が正しくありません');
+      const session = buildSessionFromRoomData(data, '----', '');
+      await idbPut('playerSession', session);
+      AppState.session = session;
+      setScreen('playerReady');
+      toast('JSONファイルからお題を読み込みました', 'ok');
+    } catch(err){
+      toast('JSONの読み込みに失敗しました: ' + err.message, 'error');
+    }
+  };
+  reader.readAsText(file);
+}
+
+/* =========================================================================
+   プレイヤー画面: 開始前の設定サマリー
+   ========================================================================= */
+function renderPlayerReady(){
+  const s = AppState.session;
+  if (!s) return renderTitle();
+  return `
+  <div class="max-w-md mx-auto px-5 pt-10">
+    <div class="text-center mb-6">
+      <div class="text-4xl mb-2">📥</div>
+      <h1 class="text-lg font-bold">お題を受信しました</h1>
+    </div>
+    <div class="bg-white border border-stone-300 rounded-2xl p-5 shadow-sm mb-6 text-sm space-y-2">
+      <div class="flex justify-between border-b border-stone-100 pb-2"><span class="text-stone-500">制限時間</span><span class="font-bold">${Math.round(s.timeLimitSec/60)}分</span></div>
+      <div class="flex justify-between border-b border-stone-100 pb-2"><span class="text-stone-500">登録お題数</span><span class="font-bold">${s.targets.length}問</span></div>
+      <div class="flex justify-between border-b border-stone-100 pb-2"><span class="text-stone-500">正解判定距離</span><span class="font-bold">半径 ${s.defaultRadius}m 以内</span></div>
+      <div class="flex justify-between items-center"><span class="text-stone-500">GPS接続状況</span><span id="gps_status_pill" class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-200 text-stone-600 border border-stone-300">${escHtml(AppState.gpsStatus.text)}</span></div>
+    </div>
+    <button onclick="startExploreRuntime()" class="w-full bg-sage text-white font-black rounded-2xl py-4 text-lg shadow-sm active:bg-sage-dark">🚀 探索を開始する</button>
+    <button onclick="goTitle()" class="w-full mt-3 bg-white border border-stone-300 rounded-xl py-2.5 text-sm text-stone-600">キャンセル</button>
+  </div>`;
+}
+
+/* =========================================================================
+   探索ゲーム本体（自由選択制）
+   ========================================================================= */
+function startExploreRuntime(){
+  AppState.screen = 'explore';
+  startGpsWatch();
+  stopTimer();
+  AppState.timerHandle = setInterval(onTimerTick, 1000);
+  render();
+}
+function startGpsWatch(){
+  if (!navigator.geolocation){
+    AppState.gpsStatus = { active:false, text:'GPS非対応', accuracy:null };
+    updateGpsStatusDom();
+    return;
+  }
+  if (AppState.gpsWatchId != null) return; // 起動時1回のみ許可
+  AppState.gpsWatchId = navigator.geolocation.watchPosition(
+    (pos) => {
+      AppState.currentPosition = pos.coords;
+      const acc = Math.round(pos.coords.accuracy);
+      AppState.gpsStatus = { active:true, text:`GPS受信中（誤差±${acc}m）`, accuracy: acc };
+      updateGpsStatusDom();
+    },
+    (err) => {
+      let text = 'GPS取得待機';
+      if (err.code === 1) text = '位置情報の利用許可が必要です';
+      AppState.gpsStatus = { active:false, text, accuracy:null };
+      updateGpsStatusDom();
+    },
+    { enableHighAccuracy:true, maximumAge:2000, timeout:15000 }
+  );
+}
+function updateGpsStatusDom(){
+  const pill = document.getElementById('gps_status_pill');
+  if (!pill) return;
+  pill.textContent = (AppState.gpsStatus.active ? '🟢 ' : '⚪ ') + AppState.gpsStatus.text;
+  pill.className = AppState.gpsStatus.active
+    ? 'px-2 py-0.5 rounded-full text-[10px] font-bold bg-sage/10 text-sage-dark border border-sage/40 whitespace-nowrap'
+    : 'px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-200 text-stone-600 border border-stone-300 whitespace-nowrap';
+}
+function stopGpsWatch(){
+  if (AppState.gpsWatchId != null && navigator.geolocation){
+    navigator.geolocation.clearWatch(AppState.gpsWatchId);
+  }
+  AppState.gpsWatchId = null;
+}
+function stopTimer(){
+  if (AppState.timerHandle){ clearInterval(AppState.timerHandle); AppState.timerHandle = null; }
+}
+function onTimerTick(){
+  const s = AppState.session;
+  if (!s) return;
+  s.remainingSec = Math.max(0, s.remainingSec - 1);
+  s.updatedAt = Date.now();
+  saveSessionToIdb();
+  if (s.remainingSec <= 0){
+    endGame();
+    return;
+  }
+  render();
+}
+function saveSessionToIdb(){
+  if (!AppState.session) return;
+  idbPut('playerSession', AppState.session).catch(()=>{});
+}
+function statusIcon(state){
+  if (state.status === 'cleared') return '✅';
+  if (state.status === 'skipped') return '⏭️';
+  if (state.currentLv > 1 || state.wrongCount > 0) return '🔵';
+  return '⬜';
+}
+function statusLabel(state){
+  if (state.status === 'cleared') return 'クリア';
+  if (state.status === 'skipped') return 'スキップ';
+  if (state.currentLv > 1 || state.wrongCount > 0) return '挑戦中';
+  return '未着手';
+}
+function renderExplore(){
+  const s = AppState.session;
+  if (!s) return renderTitle();
+  const clearedCount = Object.values(s.targetStates).filter(x => x.status==='cleared' || x.status==='skipped').length;
+
+  const gridHtml = s.targets.map(t => {
+    const state = s.targetStates[t.id];
+    const selected = s.selectedTargetId === t.id;
+    const border = selected ? 'border-sage ring-2 ring-sage' : 'border-stone-300';
+    const doneStyle = (state.status==='cleared') ? 'opacity-70' : (state.status==='skipped' ? 'opacity-50' : '');
+    return `
+    <button onclick="selectTarget('${t.id}')" class="bg-white border ${border} ${doneStyle} rounded-xl p-3 text-left shadow-sm">
+      <div class="flex items-center justify-between mb-1">
+        <span class="text-lg">${statusIcon(state)}</span>
+        <span class="text-[10px] font-bold text-stone-400">${statusLabel(state)}</span>
+      </div>
+      <div class="text-sm font-bold truncate">${escHtml(t.name)}</div>
+      ${state.status==='cleared' ? `<div class="text-xs text-sage font-bold mt-0.5">+${s.__lastEarned && s.__lastEarned[t.id] != null ? s.__lastEarned[t.id] : ''}pt</div>` : ''}
+    </button>`;
+  }).join('');
+
+  const detailHtml = s.selectedTargetId ? renderTargetDetail(s.targets.find(t=>t.id===s.selectedTargetId), s.targetStates[s.selectedTargetId]) : '';
+
+  return `
+  <div class="max-w-md mx-auto px-4 pt-4">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <div class="text-[11px] text-stone-500 font-bold">残り時間</div>
+        <div class="text-2xl font-black ${s.remainingSec<=60?'text-terracotta':''}">${fmtTime(s.remainingSec)}</div>
+      </div>
+      <div class="text-right">
+        <div class="text-[11px] text-stone-500 font-bold">合計スコア</div>
+        <div class="text-2xl font-black text-sage">${s.totalScore} pt</div>
+      </div>
+      <button onclick="confirmEndGame()" class="text-xs text-stone-400 border border-stone-300 rounded-lg px-2 py-1 ml-2">✕ 中断</button>
+    </div>
+
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs text-stone-500">進捗: ${clearedCount} / ${s.targets.length}</div>
+      <span id="gps_status_pill" class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-stone-200 text-stone-600 border border-stone-300">${escHtml(AppState.gpsStatus.text)}</span>
+    </div>
+
+    ${detailHtml}
+
+    <div class="grid grid-cols-2 gap-3 mt-2 mb-8">${gridHtml}</div>
+  </div>`;
+}
+
+function renderTargetDetail(t, state){
+  if (!t) return '';
+  const lv = state.currentLv;
+  const viewLv = state.viewLv || lv;
+  const levelDef = HINT_LEVELS[lv];
+  const photo = t.hints ? t.hints[viewLv] : null;
+  const now = Date.now();
+  const cooling = AppState.cooldownUntil > now;
+  const coolLeft = cooling ? Math.ceil((AppState.cooldownUntil - now)/1000) : 0;
+  const finished = state.status === 'cleared' || state.status === 'skipped';
+  const feedback = AppState.judgeFeedback;
+
+  const tabsHtml = [];
+  for (let i = 1; i <= lv; i++){
+    const active = i === viewLv;
+    tabsHtml.push(`<button onclick="viewHintTab('${t.id}',${i})" class="flex-shrink-0 px-3 py-1 rounded-lg text-xs font-bold ${active ? 'bg-sage text-white' : 'bg-stone-100 text-stone-600 border border-stone-300'}">写真Lv${i}（${HINT_LEVELS[i].points}pt）</button>`);
+  }
+
+  return `
+  <div id="target_detail_panel" class="bg-white border border-stone-300 rounded-2xl p-4 shadow-sm mb-4 ${feedback&&feedback.targetId===t.id ? (feedback.ok?'tc-flash-ok':'tc-flash-ng') : ''}">
+    <div class="flex items-center justify-between mb-2">
+      <div class="font-bold">${escHtml(t.name)}</div>
+      <button onclick="deselectTarget()" class="text-stone-400 text-sm">閉じる ✕</button>
+    </div>
+
+    <div class="aspect-[9/16] w-full max-w-[220px] mx-auto bg-stone-100 rounded-xl overflow-hidden border border-stone-300 mb-2">
+      ${photo ? `<img src="${photo}" class="w-full h-full object-cover">` : `<div class="w-full h-full flex items-center justify-center text-stone-400 text-sm p-4 text-center">この段階の画像は<br>登録されていません</div>`}
+    </div>
+
+    ${lv > 1 ? `<div class="flex gap-1.5 overflow-x-auto tc-scrollbar-none pb-2 mb-2">${tabsHtml.join('')}</div>` : ''}
+
+    <div class="text-center mb-3">
+      <span class="inline-block bg-cream border border-stone-300 rounded-full px-3 py-1 text-xs font-bold">
+        現在の判定Lv${lv} ${levelDef.label} ・ 獲得可能 ${state.currentPoints} pt
+      </span>
+    </div>
+
+    ${feedback && feedback.targetId===t.id ? `<div class="text-center text-sm font-bold mb-3 ${feedback.ok?'text-sage':'text-terracotta'}">${escHtml(feedback.text)}</div>` : ''}
+
+    ${finished ? `
+      <div class="text-center text-sm font-bold text-stone-500 py-2">
+        ${state.status==='cleared' ? `クリア済み（獲得 ${state.earned||0} pt）` : 'スキップ済み'}
+      </div>
+    ` : `
+      <div class="flex gap-2 mb-2">
+        <button onclick="judgeCurrentTarget()" ${cooling?'disabled':''} class="flex-1 bg-sage active:bg-sage-dark text-white font-black rounded-xl py-3 disabled:opacity-50">
+          ${cooling ? `⏳ ${coolLeft}秒` : '📍 現在地判定'}
+        </button>
+        <button onclick="revealNextHint()" ${lv>=5?'disabled':''} class="flex-1 bg-stone-800 text-white font-bold rounded-xl py-3 disabled:opacity-30">
+          次のヒント
+        </button>
+      </div>
+      <button onclick="skipTarget()" class="w-full bg-white border border-terracotta text-terracotta font-bold rounded-xl py-2.5">このお題をスキップ</button>
+    `}
+  </div>`;
+}
+
+function selectTarget(id){
+  AppState.session.selectedTargetId = id;
+  const state = AppState.session.targetStates[id];
+  if (state && state.viewLv == null) state.viewLv = state.currentLv;
+  AppState.judgeFeedback = null;
+  saveSessionToIdb();
+  render();
+}
+function viewHintTab(targetId, lv){
+  const state = AppState.session.targetStates[targetId];
+  if (!state || lv > state.currentLv) return;
+  state.viewLv = lv;
+  render();
+}
+function deselectTarget(){
+  AppState.session.selectedTargetId = null;
+  AppState.judgeFeedback = null;
+  render();
+}
+function revealNextHint(){
+  const s = AppState.session;
+  const state = s.targetStates[s.selectedTargetId];
+  if (!state || state.status !== 'untouched' || state.currentLv >= 5) return;
+  state.currentLv += 1;
+  state.currentPoints = HINT_LEVELS[state.currentLv].points;
+  state.viewLv = state.currentLv;
+  AppState.judgeFeedback = null;
+  saveSessionToIdb();
+  render();
+}
+function skipTarget(){
+  if (!confirm('このお題をスキップしますか？（ポイントは獲得できません）')) return;
+  const s = AppState.session;
+  const state = s.targetStates[s.selectedTargetId];
+  if (!state) return;
+  state.status = 'skipped';
+  AppState.judgeFeedback = null;
+  saveSessionToIdb();
+  render();
+}
+function judgeCurrentTarget(){
+  const now = Date.now();
+  if (AppState.cooldownUntil > now) return;
+  const s = AppState.session;
+  const t = s.targets.find(x => x.id === s.selectedTargetId);
+  const state = s.targetStates[s.selectedTargetId];
+  if (!t || !state || state.status !== 'untouched') return;
+
+  AppState.cooldownUntil = now + COOLDOWN_MS;
+
+  const pos = AppState.currentPosition;
+  if (!pos){
+    AppState.judgeFeedback = { targetId:t.id, ok:false, text:'GPS取得中です。少し待ってから再度お試しください。' };
+    render();
+    scheduleCooldownRerender();
+    return;
+  }
+  const radius = t.radius != null ? t.radius : s.defaultRadius;
+  const d = distMeters(pos.latitude, pos.longitude, t.lat, t.lng);
+
+  if (d <= radius){
+    state.status = 'cleared';
+    state.earned = state.currentPoints;
+    s.totalScore += state.currentPoints;
+    s.__lastEarned = s.__lastEarned || {};
+    s.__lastEarned[t.id] = state.earned;
+    AppState.judgeFeedback = { targetId:t.id, ok:true, text:`正解！ +${state.earned} pt` };
+  } else {
+    state.wrongCount += 1;
+    const floor = HINT_LEVELS[state.currentLv].floor;
+    state.currentPoints = Math.max(floor, state.currentPoints - 1);
+    const hint = d < 300 ? `（目安距離 約${Math.round(d/10)*10}m）` : '';
+    AppState.judgeFeedback = { targetId:t.id, ok:false, text:`圏外です… ${hint}` };
+  }
+  saveSessionToIdb();
+  render();
+  scheduleCooldownRerender();
+}
+function scheduleCooldownRerender(){
+  const target = AppState.cooldownUntil;
+  setTimeout(() => {
+    if (AppState.cooldownUntil === target) render();
+  }, COOLDOWN_MS + 50);
+}
+function confirmEndGame(){
+  if (!confirm('探索を中断してタイトルへ戻ります。よろしいですか？')) return;
+  endGame();
+}
+async function endGame(){
+  stopTimer();
+  stopGpsWatch();
+  const s = AppState.session;
+  AppState.lastResult = s;
+  try { await idbDelete('playerSession', 'current'); } catch(e){}
+  setScreen('result');
+}
+
+/* =========================================================================
+   リザルト画面
+   ========================================================================= */
+function renderResult(){
+  const s = AppState.lastResult;
+  if (!s) return renderTitle();
+  let clearCount = 0, missCount = 0, skipCount = 0;
+  const rows = s.targets.map(t => {
+    const state = s.targetStates[t.id];
+    const pts = state.status==='cleared' ? (state.earned||0) : 0;
+    if (state.status==='cleared') clearCount++;
+    else if (state.status==='skipped') skipCount++;
+    missCount += state.wrongCount || 0;
+    return `
+    <div class="flex items-center justify-between border-b border-stone-200 py-2 text-sm">
+      <div class="flex items-center gap-2">
+        <span>${statusIcon(state)}</span>
+        <span class="font-medium">${escHtml(t.name)}</span>
+      </div>
+      <span class="font-bold ${pts>0?'text-sage':'text-stone-400'}">${pts>0?'+':''}${pts} pt</span>
+    </div>`;
+  }).join('');
+
+  return `
+  <div class="max-w-md mx-auto px-5 pt-10">
+    <div class="text-center mb-6">
+      <div class="text-4xl mb-2">🏁</div>
+      <h1 class="text-lg font-bold">探索終了</h1>
+    </div>
+    <div class="bg-white border border-stone-300 rounded-2xl p-6 shadow-sm text-center mb-5">
+      <p class="text-xs text-stone-500 mb-1">合計スコア</p>
+      <p class="text-5xl font-black text-sage">${s.totalScore}<span class="text-lg ml-1">pt</span></p>
+      <hr class="border-stone-200 my-4">
+      <div class="grid grid-cols-3 gap-2 text-xs text-left">
+        <div class="bg-stone-50 p-2.5 rounded-xl border border-stone-200">
+          <div class="text-stone-500">正解数</div>
+          <div class="text-base font-bold text-sage">${clearCount}</div>
+        </div>
+        <div class="bg-stone-50 p-2.5 rounded-xl border border-stone-200">
+          <div class="text-stone-500">お手つき</div>
+          <div class="text-base font-bold text-terracotta">${missCount} 回</div>
+        </div>
+        <div class="bg-stone-50 p-2.5 rounded-xl border border-stone-200">
+          <div class="text-stone-500">スキップ</div>
+          <div class="text-base font-bold text-stone-700">${skipCount}</div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-white border border-stone-300 rounded-2xl p-4 shadow-sm mb-8">${rows}</div>
+    <button onclick="backToTitleFromResult()" class="w-full bg-stone-800 text-white font-bold rounded-xl py-3">タイトルへ戻る</button>
+  </div>`;
+}
+function backToTitleFromResult(){
+  AppState.session = null;
+  AppState.lastResult = null;
+  AppState.playerJoin = { dbUrl: localStorage.getItem(LS_KEY_DB_URL) || '', code:'' };
+  setScreen('title');
+}
+
+/* =========================================================================
+   初期化
+   ========================================================================= */
+async function init(){
+  const params = new URLSearchParams(location.search);
+  AppState.urlRoomCode = (params.get('room') || '').replace(/[^0-9]/g,'').slice(0,4);
+  AppState.urlDbUrl = params.get('db') || '';
+
+  startGpsWatch(); // 起動時に1回だけ位置情報の利用許可を求める
+
+  await checkResumeOnLoad();
+
+  if (!AppState.resumeAvailable && AppState.urlRoomCode){
+    goPlayerJoin();
+    return;
+  }
+  render();
+}
+
+window.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
+
