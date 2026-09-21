@@ -25,7 +25,7 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/open-location-code@1.0.3/openlocationcode.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 
 <style>
   html, body { background:#FAF7EE; overscroll-behavior:none; -webkit-tap-highlight-color: transparent; }
@@ -791,7 +791,7 @@ function renderGmCreated(){
     </div>
 
     <div class="bg-white border border-stone-300 rounded-2xl p-5 shadow-sm mb-5">
-      <canvas id="room_qr_canvas" class="mx-auto"></canvas>
+      <div id="room_qr_canvas" class="flex justify-center"></div>
       <p class="text-[11px] text-stone-400 mt-2">QRコードを読み取るとURLに自動で暗号が入力されます</p>
     </div>
 
@@ -809,14 +809,20 @@ function buildInviteUrl(code, dbUrl){
   return base + '?' + params.toString();
 }
 function drawRoomQr(){
-  const canvas = document.getElementById('room_qr_canvas');
-  if (!canvas || typeof QRCode === 'undefined') return;
+  const container = document.getElementById('room_qr_canvas');
+  if (!container || typeof QRCode === 'undefined') return;
+  container.innerHTML = '';
   const url = buildInviteUrl(AppState.gmCreatedCode, AppState.gmDraft.dbUrl);
   try {
-    QRCode.toCanvas(canvas, url, { width: 200, margin: 1, color: { dark:'#1c1917', light:'#FFFFFF' } }, (err) => {
-      if (err) console.error(err);
+    new QRCode(container, {
+      text: url,
+      width: 200,
+      height: 200,
+      colorDark: '#1c1917',
+      colorLight: '#FFFFFF',
+      correctLevel: QRCode.CorrectLevel.M
     });
-  } catch(e){}
+  } catch(e){ console.error(e); }
 }
 function copyInviteUrl(){
   const url = buildInviteUrl(AppState.gmCreatedCode, AppState.gmDraft.dbUrl);
